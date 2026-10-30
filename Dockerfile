@@ -15,4 +15,5 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py .
 
-CMD ["python", "bot.py"]
+# Har ishga tushganda yt-dlp ni eng yangi versiyaga yangilaydi (YouTube tez-tez oʻzgaradi)
+CMD ["sh", "-c", "pip install -q -U --no-cache-dir 'yt-dlp[default]' || true; exec python bot.py"]
