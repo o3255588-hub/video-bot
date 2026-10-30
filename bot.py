@@ -8,14 +8,15 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile, Message
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import BufferedInputFile, FSInputFile, Message
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 from shazamio import Shazam
@@ -27,6 +28,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)  # ixtiyoriy: xatolar shu ID ga yuboriladi
 PORT = int(os.getenv("PORT", "10000"))  # Render portni oʻzi beradi
 # Render web servislar uchun RENDER_EXTERNAL_URL ni avtomatik beradi
+PROXY_URL = os.getenv("PROXY_URL")  # ixtiyoriy: faqat YouTube uchun ishlatiladi
 BASE_URL = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()
@@ -78,10 +80,17 @@ def is_supported(url: str) -> bool:
     return any(host == d or host.endswith("." + d) for d in SUPPORTED_DOMAINS)
 
 
-def base_opts() -> dict:
+def is_youtube(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host.endswith("youtube.com") or host.endswith("youtu.be")
+
+
+def base_opts(use_proxy: bool = False) -> dict:
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
     if COOKIES_FILE:
         opts["cookiefile"] = COOKIES_FILE
+    if use_proxy and PROXY_URL:
+        opts["proxy"] = PROXY_URL
     return opts
 
 
@@ -121,6 +130,76 @@ async def notify_admin(bot: Bot, text: str) -> None:
         log.exception("Adminga xabar yuborib boʻlmadi")
 
 
+# ------------------------------------------------------------------ diagnostika
+class ListLogger:
+    """yt-dlp xabarlarini roʻyxatga yigʻadi."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def debug(self, msg) -> None:
+        self.lines.append(str(msg))
+
+    def info(self, msg) -> None:
+        self.lines.append(str(msg))
+
+    def warning(self, msg) -> None:
+        self.lines.append("WARNING: " + str(msg))
+
+    def error(self, msg) -> None:
+        self.lines.append("ERROR: " + str(msg))
+
+
+def tool_version(name: str) -> str:
+    path = shutil.which(name)
+    if not path:
+        return "yoq"
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
+        return ((out.stdout or out.stderr).splitlines() or ["?"])[0]
+    except Exception as e:
+        return f"xato: {e}"
+
+
+def run_debug(url: str) -> str:
+    """Bitta havolani yuklamasdan tekshirib, batafsil hisobot qaytaradi (parol/cookie qiymatlarisiz)."""
+    head = [
+        f"yt-dlp: {YTDLP_VERSION}",
+        f"ffmpeg: {tool_version('ffmpeg')[:60]}",
+        f"deno: {tool_version('deno')}",
+        f"proxy: {'bor' if PROXY_URL else 'yoq'}",
+    ]
+    if COOKIES_FILE:
+        raw = Path(COOKIES_FILE).read_text(errors="ignore")
+        head.append(
+            f"cookies: bor, {len(raw.splitlines())} qator, "
+            f"LOGIN_INFO={'LOGIN_INFO' in raw}, SAPISID={'SAPISID' in raw}"
+        )
+    else:
+        head.append("cookies: yoq")
+
+    logger = ListLogger()
+    opts = base_opts(use_proxy=is_youtube(url)) | {
+        "verbose": True,
+        "logger": logger,
+        "quiet": False,
+        "no_warnings": False,
+        "skip_download": True,
+        "format": "bv*+ba/b",
+    }
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        formats = (info or {}).get("formats") or []
+        top = max((f.get("height") or 0 for f in formats), default=0)
+        result = f"NATIJA: OK — {len(formats)} ta format, eng yuqori balandlik: {top}"
+    except Exception as e:
+        result = f"NATIJA: XATO — {e}"
+
+    text = "\n".join(head + ["", result, "", "--- yt-dlp log ---"] + logger.lines)
+    return text[:40000]
+
+
 # ------------------------------------------------------------------ video
 def download_video(url: str, out_dir: Path) -> tuple[Path, dict]:
     """
@@ -132,7 +211,7 @@ def download_video(url: str, out_dir: Path) -> tuple[Path, dict]:
     for res in RES_LADDER:
         for old in out_dir.glob("video.*"):
             old.unlink()
-        opts = base_opts() | {
+        opts = base_opts(use_proxy=is_youtube(url)) | {
             "outtmpl": str(out_dir / "video.%(ext)s"),
             "format": "bv*+ba/b",
             "format_sort": [f"res:{res}", "vcodec:h264", "acodec:aac"],
@@ -234,7 +313,7 @@ def download_song(query: str, out_dir: Path) -> Path | None:
     for prefix in ("ytsearch3:", "scsearch3:"):
         for old in out_dir.glob("song.*"):
             old.unlink()
-        opts = base_opts() | {
+        opts = base_opts(use_proxy=prefix.startswith("yt")) | {
             "outtmpl": str(out_dir / "song.%(ext)s"),
             "format": "bestaudio/best",
             "match_filter": match_filter_func("duration > 45 & duration < 600"),
@@ -265,6 +344,17 @@ async def start(message: Message):
         "Menga YouTube, TikTok yoki Instagram video havolasini yuboring — "
         "men videoni yuklab beraman va undagi musiqani ham topishga harakat qilaman 🎵"
     )
+
+
+@dp.message(Command("debug"))
+async def debug_cmd(message: Message, command: CommandObject):
+    if ADMIN_ID and message.from_user.id != ADMIN_ID:
+        return
+    url = (command.args or "").strip() or "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    status = await message.answer("🔍 Tekshirilmoqda, 20–40 soniya kuting...")
+    text = await asyncio.to_thread(run_debug, url)
+    await message.answer_document(BufferedInputFile(text.encode("utf-8"), filename="debug.txt"))
+    await status.delete()
 
 
 @dp.message(F.text.regexp(URL_RE))
