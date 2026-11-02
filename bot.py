@@ -35,6 +35,19 @@ WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()
 MAX_SIZE = 50 * 1024 * 1024  # Telegram Bot API yuklash limiti: 50 MB
 MAX_PARALLEL = 2  # Render Free = 512 MB xotira, shuning uchun kam
 RES_LADDER = [1080, 720, 480, 360]  # avval eng yaxshi sifat, sigʻmasa pastroq
+# YouTube uchun usullar (ketma-ket sinab koʻriladi). tv va web_safari akkaunt cookies bilan
+# PO token talab qilmaydi (yt-dlp PO Token Guide).
+YT_VARIANTS: list[dict] = [
+    {},  # yt-dlp ning oʻz tanlovi
+    {"youtube": {"player_client": ["tv", "web_safari"]}},
+    {"youtube": {"player_client": ["web_safari"]}},
+    {"youtube": {"player_client": ["android_vr"]}},
+    {"youtube": {"player_client": ["web_embedded"]}},
+]
+
+
+def variant_name(v: dict) -> str:
+    return ",".join(v["youtube"]["player_client"]) if v else "default"
 
 SUPPORTED_DOMAINS = (
     "youtube.com",
@@ -161,8 +174,32 @@ def tool_version(name: str) -> str:
         return f"xato: {e}"
 
 
+def try_variant(url: str, extractor_args: dict, verbose: bool) -> tuple[str, list[str]]:
+    """Bitta usul bilan eng past sifatni haqiqatan yuklab koʻradi (403 xatolarini ham aniqlaydi)."""
+    logger = ListLogger()
+    with tempfile.TemporaryDirectory(prefix="dbg_") as d:
+        opts = base_opts(use_proxy=is_youtube(url)) | {
+            "verbose": verbose,
+            "logger": logger,
+            "quiet": False,
+            "no_warnings": False,
+            "format": "worst",
+            "outtmpl": f"{d}/t.%(ext)s",
+            "max_filesize": 20 * 1024 * 1024,
+        }
+        if extractor_args:
+            opts["extractor_args"] = extractor_args
+        try:
+            with YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+            size = sum(f.stat().st_size for f in Path(d).glob("t.*"))
+            return f"OK ({size // 1024} KB yuklandi)", logger.lines
+        except Exception as e:
+            return f"XATO — {str(e)[:300]}", logger.lines
+
+
 def run_debug(url: str) -> str:
-    """Bitta havolani yuklamasdan tekshirib, batafsil hisobot qaytaradi (parol/cookie qiymatlarisiz)."""
+    """Havolani barcha usullar bilan tekshirib, hisobot qaytaradi (parol/cookie qiymatlarisiz)."""
     head = [
         f"yt-dlp: {YTDLP_VERSION}",
         f"ffmpeg: {tool_version('ffmpeg')[:60]}",
@@ -178,33 +215,25 @@ def run_debug(url: str) -> str:
     else:
         head.append("cookies: yoq")
 
-    logger = ListLogger()
-    opts = base_opts(use_proxy=is_youtube(url)) | {
-        "verbose": True,
-        "logger": logger,
-        "quiet": False,
-        "no_warnings": False,
-        "skip_download": True,
-        "format": "bv*+ba/b",
-    }
-    try:
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        formats = (info or {}).get("formats") or []
-        top = max((f.get("height") or 0 for f in formats), default=0)
-        result = f"NATIJA: OK — {len(formats)} ta format, eng yuqori balandlik: {top}"
-    except Exception as e:
-        result = f"NATIJA: XATO — {e}"
+    variants = YT_VARIANTS if is_youtube(url) else [{}]
+    summary: list[str] = []
+    first_log: list[str] = []
+    for i, v in enumerate(variants):
+        result, lines = try_variant(url, v, verbose=(i == 0))
+        summary.append(f"[{variant_name(v)}] {result}")
+        if i == 0:
+            first_log = lines
 
-    text = "\n".join(head + ["", result, "", "--- yt-dlp log ---"] + logger.lines)
+    text = "\n".join(
+        head + ["", "NATIJALAR:"] + summary + ["", "--- yt-dlp log (birinchi usul) ---"] + first_log
+    )
     return text[:40000]
 
 
 # ------------------------------------------------------------------ video
-def download_video(url: str, out_dir: Path) -> tuple[Path, dict]:
+def _download_once(url: str, out_dir: Path, extractor_args: dict) -> tuple[Path, dict]:
     """
-    Videoni yuklaydi (bloklovchi funksiya, thread ichida chaqiriladi).
-    "res" — eng kichik oʻlcham boʻyicha (vertikal videolar ham toʻgʻri hisoblanadi).
+    Bitta usul bilan yuklaydi. "res" — eng kichik oʻlcham boʻyicha (vertikal videolar ham toʻgʻri).
     Avval 1080p, fayl 50 MB dan oshsa 720p, 480p, 360p.
     """
     too_big = False
@@ -220,6 +249,8 @@ def download_video(url: str, out_dir: Path) -> tuple[Path, dict]:
             "max_filesize": MAX_SIZE,
             "postprocessor_args": {"merger": ["-movflags", "+faststart"]},
         }
+        if extractor_args:
+            opts["extractor_args"] = extractor_args
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
         if info and info.get("_type") == "playlist" and info.get("entries"):
@@ -235,6 +266,25 @@ def download_video(url: str, out_dir: Path) -> tuple[Path, dict]:
     if too_big:
         raise VideoTooLarge()
     raise RuntimeError("Video fayli topilmadi")
+
+
+def download_video(url: str, out_dir: Path) -> tuple[Path, dict]:
+    """YouTube uchun bir necha usulni ketma-ket sinaydi, boshqa saytlar uchun bittasini."""
+    variants = YT_VARIANTS if is_youtube(url) else [{}]
+    errors: list[str] = []
+    first_err: Exception | None = None
+    for v in variants:
+        try:
+            return _download_once(url, out_dir, v)
+        except VideoTooLarge:
+            raise
+        except Exception as e:
+            log.warning("[%s] usuli muvaffaqiyatsiz: %s", variant_name(v), str(e)[:300])
+            errors.append(f"[{variant_name(v)}] {str(e)[:300]}")
+            first_err = first_err or e
+    assert first_err is not None
+    first_err.all_errors = errors  # type: ignore[attr-defined]
+    raise first_err
 
 
 # ------------------------------------------------------------------ ffmpeg
@@ -380,7 +430,8 @@ async def handle_link(message: Message):
             except Exception as e:
                 log.exception("Video yuklashda xato: %s", url)
                 await status.edit_text(friendly_error(e))
-                await notify_admin(bot, f"❗ Yuklash xatosi\n{url}\n\n{str(e)[:1500]}\n\n{admin_hint(e)}")
+                details = "\n".join(getattr(e, "all_errors", None) or [str(e)[:1500]])
+                await notify_admin(bot, f"❗ Yuklash xatosi\n{url}\n\n{details[:2500]}\n\n{admin_hint(e)}")
                 return
 
             # 2) Videoni yuborish
@@ -479,3 +530,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
