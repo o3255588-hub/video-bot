@@ -29,7 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)  # ixtiyoriy: xatolar shu ID ga yuboriladi
 PORT = int(os.getenv("PORT", "10000"))  # Render portni oʻzi beradi
 # Render web servislar uchun RENDER_EXTERNAL_URL ni avtomatik beradi
-PROXY_URL = os.getenv("PROXY_URL")  # ixtiyoriy: faqat YouTube uchun ishlatiladi
+PROXY_URL = os.getenv("PROXY_URL")  # ixtiyoriy: faqat YouTube uchun ishlat
 BASE_URL = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()
